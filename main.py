@@ -13,6 +13,10 @@ from typing import List
 import os
 from datetime import datetime
 import logging
+from dotenv import load_dotenv
+
+# .env 파일 로드
+load_dotenv()
 
 # -------------------------
 # 로깅 설정
