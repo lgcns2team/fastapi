@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 import boto3
 import json
-from typing import List
+from typing import List, Optional
 import os
 from datetime import datetime
 import logging
@@ -69,6 +69,7 @@ class ChatRequest(BaseModel):
     messages: List[Message]
     max_tokens: int = Field(default=4096)
     temperature: float = Field(default=1.0)
+    system: Optional[str] = None
 
 class KnowledgeBaseRequest(BaseModel):
     query: str = Field(..., description="사용자 질문")
@@ -158,6 +159,9 @@ async def stream_chat_response(request: ChatRequest):
             "temperature": request.temperature,
             "messages": messages
         }
+
+        if request.system:
+            body["system"] = request.system
 
         logger.info(f"Chat request - Model: {request.model}")
 
