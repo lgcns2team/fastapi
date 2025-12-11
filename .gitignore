@@ -39,7 +39,6 @@ env/
 .DS_Store
 Thumbs.db
 
-Dockerfile
 docker-compose.yml
 
 .venv/

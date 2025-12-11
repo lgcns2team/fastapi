@@ -269,22 +269,18 @@ async def stream_prompt_response(request: PromptRequest):
     try:
         logger.info(f"Prompt request - Prompt ID: {request.prompt_id}, Query: {request.user_query[:50]}...")
         
-        # Bedrock Agent client for prompt management
         bedrock_agent = boto3.client(
             service_name='bedrock-agent',
             region_name=os.getenv('AWS_REGION', 'ap-northeast-2')
         )
         
-        # ARN 형식인지 확인
         if request.prompt_id.startswith('arn:'):
             prompt_identifier = request.prompt_id
         else:
-            # ID만 있는 경우 ARN 생성
             prompt_identifier = f"arn:aws:bedrock:{os.getenv('AWS_REGION', 'ap-northeast-2')}:125814533785:prompt/{request.prompt_id}"
         
         logger.info(f"Using Prompt ARN: {prompt_identifier}")
         
-        # Get prompt information
         try:
             prompt_response = bedrock_agent.get_prompt(
                 promptIdentifier=prompt_identifier
@@ -292,7 +288,6 @@ async def stream_prompt_response(request: PromptRequest):
             
             logger.info(f"Prompt retrieved: {prompt_response.get('name', 'Unknown')}")
             
-            # Extract prompt configuration
             variants = prompt_response.get('variants', [])
             if not variants:
                 raise ValueError("Prompt has no variants")
@@ -302,10 +297,8 @@ async def stream_prompt_response(request: PromptRequest):
             
             logger.info(f"Template type: {template_type}")
             
-            # Get model ID from prompt or use default
             model_id = prompt_response.get('defaultModelId', 'anthropic.claude-3-5-sonnet-20240620-v1:0')
             
-            # Prepare prompt variables
             prompt_variables = {
                 "user_query": request.user_query,
                 **request.variables
@@ -316,18 +309,14 @@ async def stream_prompt_response(request: PromptRequest):
                 template_config = variant.get('templateConfiguration', {})
                 template_text = template_config.get('text', {}).get('text', '')
                 
-                # Replace variables in template
                 formatted_prompt = template_text
                 for var_name, var_value in prompt_variables.items():
-                    # Match Bedrock variable syntax: {{variable_name}}
                     formatted_prompt = formatted_prompt.replace(f"{{{{{var_name}}}}}", str(var_value))
                 
                 logger.info(f"Formatted prompt (first 100 chars): {formatted_prompt[:100]}...")
                 
-                # Get inference configuration from prompt
                 inference_config = variant.get('inferenceConfiguration', {})
                 
-                # Build request body for Claude
                 body = {
                     "anthropic_version": "bedrock-2023-05-31",
                     "max_tokens": inference_config.get('maxTokens', 4096),
@@ -340,30 +329,34 @@ async def stream_prompt_response(request: PromptRequest):
                     ]
                 }
                 
-                # Add stop sequences if defined
                 if 'stopSequences' in inference_config:
                     body['stop_sequences'] = inference_config['stopSequences']
                 
                 logger.info(f"Invoking model: {model_id}")
                 
-                # Invoke model with streaming
                 response = bedrock_runtime.invoke_model_with_response_stream(
                     modelId=model_id,
                     body=json.dumps(body)
                 )
                 
-                # Stream the response
+                full_text = ""
+                
                 for event in response['body']:
                     chunk = json.loads(event['chunk']['bytes'])
                     
                     if chunk['type'] == 'content_block_delta':
                         text = chunk['delta'].get('text', '')
                         if text:
+                            full_text += text
                             yield f"data: {json.dumps({'type': 'content', 'text': text}, ensure_ascii=False)}\n\n"
+                            logger.info(f"Sent text chunk: {text[:30]}...")
                     
                     elif chunk['type'] == 'message_stop':
-                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                        break
+                        logger.info(f"Message stop received, but continuing to process events")
+                
+                # for 루프가 끝난 후에 done 전송
+                logger.info(f"Stream complete. Total text length: {len(full_text)}")
+                yield f"data: {json.dumps({'type': 'done', 'total_length': len(full_text)})}\n\n"
             
             # Process CHAT template
             elif template_type == 'CHAT':
@@ -374,55 +367,40 @@ async def stream_prompt_response(request: PromptRequest):
                 
                 logger.info(f"CHAT template - Messages: {len(messages)}, System prompts: {len(system_prompts)}")
                 
-                # Log raw messages for debugging
-                for i, msg in enumerate(messages):
-                    logger.info(f"Raw message {i}: role={msg.get('role')}, content={msg.get('content')}")
-                
-                # Get inference configuration from prompt
                 inference_config = variant.get('inferenceConfiguration', {})
                 
-                # Process messages and replace variables
                 formatted_messages = []
                 for msg in messages:
                     role = msg.get('role', 'user')
                     content_blocks = msg.get('content', [])
                     
-                    # Process each content block
                     formatted_content = []
                     for block in content_blocks:
                         if 'text' in block:
                             text = block['text']
-                            # Replace variables
                             for var_name, var_value in prompt_variables.items():
                                 text = text.replace(f"{{{{{var_name}}}}}", str(var_value))
-                            # Only add non-empty text
                             if text.strip():
                                 formatted_content.append({"type": "text", "text": text})
                     
                     if formatted_content:
-                        # Simplify for Claude API - just extract text
                         content_text = " ".join([c['text'] for c in formatted_content if 'text' in c])
-                        if content_text.strip():  # Only add messages with non-empty content
+                        if content_text.strip():
                             formatted_messages.append({
                                 "role": role,
                                 "content": content_text
                             })
                 
-                # If no valid messages or last message is not user, add user_query as final user message
                 if not formatted_messages or formatted_messages[-1].get('role') != 'user':
                     formatted_messages.append({
                         "role": "user",
                         "content": request.user_query
                     })
-                # If there are messages but first user message is just a variable placeholder, replace it
                 elif formatted_messages and not formatted_messages[0].get('content', '').strip():
                     formatted_messages[0]['content'] = request.user_query
                 
                 logger.info(f"Formatted {len(formatted_messages)} messages")
-                for i, msg in enumerate(formatted_messages):
-                    logger.info(f"Final message {i}: role={msg['role']}, content={msg['content'][:50] if msg['content'] else 'EMPTY'}...")
                 
-                # Build request body for Claude
                 body = {
                     "anthropic_version": "bedrock-2023-05-31",
                     "max_tokens": inference_config.get('maxTokens', 4096),
@@ -430,46 +408,54 @@ async def stream_prompt_response(request: PromptRequest):
                     "messages": formatted_messages
                 }
                 
-                # Add system prompts if any
                 if system_prompts:
                     system_text = []
                     for sys_prompt in system_prompts:
                         if 'text' in sys_prompt:
                             text = sys_prompt['text']
-                            # Replace variables in system prompt
                             for var_name, var_value in prompt_variables.items():
                                 text = text.replace(f"{{{{{var_name}}}}}", str(var_value))
                             system_text.append(text)
                     
                     if system_text:
                         body['system'] = " ".join(system_text)
-                        logger.info(f"Added system prompt: {body['system'][:100]}...")
                 
-                # Add stop sequences if defined
                 if 'stopSequences' in inference_config:
                     body['stop_sequences'] = inference_config['stopSequences']
                 
                 logger.info(f"Invoking model: {model_id}")
                 
-                # Invoke model with streaming
                 response = bedrock_runtime.invoke_model_with_response_stream(
                     modelId=model_id,
                     body=json.dumps(body)
                 )
                 
-                # Stream the response
+                full_text = ""
+                buffer = ""  # ⭐ 버퍼 추가
+                buffer_size = 10  # ⭐ 50자씩 모아서 전송
+                
                 for event in response['body']:
                     chunk = json.loads(event['chunk']['bytes'])
                     
                     if chunk['type'] == 'content_block_delta':
                         text = chunk['delta'].get('text', '')
                         if text:
-                            yield f"data: {json.dumps({'type': 'content', 'text': text}, ensure_ascii=False)}\n\n"
+                            full_text += text
+                            buffer += text
+                            if len(buffer) >= buffer_size:
+                                yield f"data: {json.dumps({'type': 'content', 'text': buffer}, ensure_ascii=False)}\n\n"
+                                logger.info(f"Sent text chunk: {buffer[:30]}...")
+                                buffer = ""
                     
                     elif chunk['type'] == 'message_stop':
-                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                        break
-            
+                        logger.info(f"Message stop received, but continuing to process events")
+                
+                # for 루프가 끝난 후에 done 전송
+                logger.info(f"Stream complete. Total text length: {len(full_text)}")
+                yield f"data: {json.dumps({'type': 'done', 'total_length': len(full_text)})}\n\n"
+                if buffer:
+                    yield f"data: {json.dumps({'type': 'content', 'text': buffer}, ensure_ascii=False)}\n\n"
+                    logger.info(f"Sent final buffer: {buffer[:30]}...")
             else:
                 raise ValueError(f"Unsupported template type: {template_type}")
         
@@ -484,7 +470,6 @@ async def stream_prompt_response(request: PromptRequest):
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
         yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
-
 # -------------------------
 # 글로벌 예외 핸들러
 # -------------------------
